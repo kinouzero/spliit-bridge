@@ -1,0 +1,12 @@
+{
+  "groups": [
+    {
+      "id": "YOUR_GROUP_ID",
+      "name": "Shared expenses"
+    },
+    {
+      "id": "YOUR_SECOND_GROUP_ID",
+      "name": "Household bills"
+    }
+  ]
+}

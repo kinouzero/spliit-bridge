@@ -1,0 +1,36 @@
+services:
+  spliit-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spliit-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      CONFIG_PATH: /app/config.json
+      SPLIIT_BASE_URL: ${SPLIIT_BASE_URL:-http://spliit:3000}
+      API_KEY: ${API_KEY:?Set API_KEY in the .env file}
+      ALLOW_CREATE: ${ALLOW_CREATE:-false}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config.json:/app/config.json:ro
+    ports:
+      - "127.0.0.1:8787:8787"
+    networks:
+      - spliit-net
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+
+networks:
+  spliit-net:
+    external: true
+    name: ${SPLIIT_DOCKER_NETWORK:-spliit-net}
