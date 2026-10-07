@@ -1,8 +1,12 @@
 # Spliit Bridge
 
-A lightweight Python API bridge for Spliit. It exposes a small, API-key-protected interface for listing configured groups, retrieving group details and categories, previewing expense payloads, and optionally creating expenses.
+A lightweight Python API bridge for [Spliit](https://github.com/spliit-app/spliit). It exposes a small, API-key-protected interface for listing configured groups, retrieving group details and categories, previewing expense payloads, and optionally creating expenses.
 
 The service uses Python's standard library only.
+
+## Disclaimer
+
+This is an independent, unofficial project. It is not affiliated with, endorsed by, or maintained by the Spliit project or its contributors. The Spliit name is used solely to identify the application this bridge integrates with.
 
 ## Features
 
@@ -249,6 +253,6 @@ pytest -q
 
 `pytest.ini` measures all of `app`, including branches, and requires **100% coverage**. Every run generates `htmlcov/index.html` and `coverage.xml`; these generated files are ignored by Git. To run a focused test without the full-suite coverage gate, use e.g. `pytest --no-cov tests/test_auth.py`.
 
-Tests use local HTTP servers and controlled network failures; they need no running Spliit instance, Docker daemon, or external network. See [TEST_PLAN.md](TEST_PLAN.md) for the audit findings, test scope, and verification limits.
+Tests use local HTTP servers and controlled network failures; they need no running Spliit instance, Docker daemon, or external network.
 
 CI runs compilation, lint, and tests on Python 3.12 and 3.13, uploads coverage reports for each version, then builds the Docker image. Release publishing remains restricted to version tags.
