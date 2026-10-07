@@ -16,8 +16,12 @@ env:
 
 jobs:
   test:
-    name: Test & Lint
+    name: Test & Lint (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -26,7 +30,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install development dependencies
         run: |
@@ -44,6 +48,16 @@ jobs:
       - name: Test
         run: |
           pytest -q
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: warn
 
   docker-build:
     name: Build Docker Image

@@ -32,7 +32,7 @@ class FakeUpstream:
         self.handler = handler
         self.requests = []
         self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
 
     @property
     def base_url(self):
@@ -62,8 +62,9 @@ class UpstreamHandler(server.BaseHTTPRequestHandler):
         elif self.path.startswith("/api/trpc/groups.getDetails"):
             body = (
                 b'{"result":{"data":{"json":'
-                b'{"members":[{"id":"p1","name":"Alice","email":"a@example.com"},'
-                b'{"id":"p2","name":"Bob","email":"b@example.com"}]}}}}'
+                b'{"group":{"id":"group-1","name":"Group","participants":['
+                b'{"id":"p1","name":"Alice","email":"a@example.com"},'
+                b'{"id":"p2","name":"Bob","email":"b@example.com"}]},"participantsWithExpenses":[]}}}}'
             )
             self.send_response(200)
         else:
@@ -99,12 +100,14 @@ def upstream(monkeypatch):
 @pytest.fixture
 def http_server(config_file):
     httpd = server.BridgeHTTPServer(("127.0.0.1", 0), server.BridgeHandler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
 
     host, port = httpd.server_address
-    yield HTTPConnection(host, port)
+    connection = HTTPConnection(host, port, timeout=3)
+    yield connection
 
+    connection.close()
     httpd.shutdown()
     httpd.server_close()
     thread.join(timeout=2)
@@ -118,7 +121,6 @@ def auth_headers():
 def request_json(connection, method, path, body=None, headers=None):
     headers = dict(headers or {})
     if body is not None:
-        import json
         payload = json.dumps(body).encode()
         headers.setdefault("Content-Type", "application/json")
         headers.setdefault("Content-Length", str(len(payload)))
@@ -127,6 +129,5 @@ def request_json(connection, method, path, body=None, headers=None):
     connection.request(method, path, body=payload, headers=headers)
     response = connection.getresponse()
     raw = response.read()
-    import json
     data = json.loads(raw) if raw else None
     return response.status, data

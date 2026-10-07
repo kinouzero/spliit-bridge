@@ -50,4 +50,4 @@ def test_group_details_are_forwarded_to_spliit(
         headers=auth_headers,
     )
     assert status == 200
-    assert data["data"]["members"][0]["id"] == "p1"
+    assert data["data"]["group"]["participants"][0]["id"] == "p1"

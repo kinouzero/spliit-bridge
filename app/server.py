@@ -10,9 +10,10 @@ import secrets
 import string
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -25,6 +26,7 @@ SPLIIT_BASE_URL = os.getenv("SPLIIT_BASE_URL", "http://spliit:3000").rstrip("/")
 API_KEY = os.getenv("API_KEY", "")
 ALLOW_CREATE = os.getenv("ALLOW_CREATE", "false").strip().lower() in {"1", "true", "yes", "on"}
 MAX_BODY = 16 * 1024
+REQUEST_TIMEOUT = 10.0
 MAX_AMOUNT_EUR = Decimal("100000")
 MAX_SHARES = Decimal("1000000")
 ALLOWED_SPLIT_MODES = {"EVENLY", "BY_SHARES", "BY_AMOUNT", "BY_PERCENTAGE"}
@@ -36,7 +38,7 @@ LOG = logging.getLogger("spliit_bridge")
 RATE_WINDOW = 60.0
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 _rate_lock = threading.Lock()
-_requests: dict[str, deque[float]] = defaultdict(deque)
+_requests: OrderedDict[str, deque[float]] = OrderedDict()
 
 
 def json_bytes(value):
@@ -46,9 +48,9 @@ def json_bytes(value):
 def load_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config = json.load(f)
-    if not isinstance(config, dict) or not isinstance(config.get("groups", []), list):
+    if not isinstance(config, dict) or not isinstance(config.get("groups"), list):
         raise ValueError("Invalid config structure")
-    groups, seen = config.get("groups", []), set()
+    groups, seen = config["groups"], set()
     for group in groups:
         if not isinstance(group, dict):
             raise ValueError("Invalid group configuration")
@@ -63,7 +65,10 @@ def load_config():
     return config
 
 
-CONFIG = None
+class ConfigError(RuntimeError):
+    """Configuration cannot be used; do not treat it as invalid client input."""
+
+
 CONFIG_LOCK = threading.Lock()
 
 
@@ -71,7 +76,10 @@ def get_config():
     # Read the small config on demand so config changes apply without restart.
     # Fail closed if it becomes unreadable or invalid.
     with CONFIG_LOCK:
-        return load_config()
+        try:
+            return load_config()
+        except (OSError, ValueError) as exc:
+            raise ConfigError("Configuration unavailable") from exc
 
 
 def unwrap_trpc(payload):
@@ -94,7 +102,7 @@ def upstream_call(procedure, input_value=None, *, mutation=False, date_paths=Non
         req = Request(url, data=data, headers=headers, method="POST")
     else:
         if input_value is not None:
-            encoded = json.dumps({"json": input_value}, separators=(",", ":"), ensure_ascii=False)
+            encoded = json_bytes({"json": input_value}).decode("utf-8")
             url += "?" + urlencode({"input": encoded})
         req = Request(url, headers={"Accept": "application/json"})
     try:
@@ -113,7 +121,7 @@ def upstream_call(procedure, input_value=None, *, mutation=False, date_paths=Non
         except Exception:
             pass
         raise RuntimeError(f"upstream_http_{exc.code}") from None
-    except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
+    except (URLError, OSError, HTTPException, ValueError, RecursionError):
         raise RuntimeError("upstream_unavailable") from None
 
 
@@ -135,23 +143,23 @@ def allowed_group(group_id):
 
 
 def participant_ids_from_details(value):
-    """Extract candidate participant IDs from known participant-like objects."""
-    found = set()
+    """Read only the explicit participant list, never unrelated named objects.
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            oid = obj.get("id")
-            if isinstance(oid, str) and ID_RE.fullmatch(oid) and any(
-                key in obj for key in ("name", "user", "isUser", "email", "color")
-            ):
-                found.add(oid)
-            for child in obj.values():
-                walk(child)
-        elif isinstance(obj, list):
-            for child in obj:
-                walk(child)
-    walk(value)
-    return found
+    Spliit returns {"group": {"participants": [...]}}. Direct group objects
+    and the older bridge's "members" shape remain supported.
+    """
+    if not isinstance(value, dict):
+        return set()
+    group = value.get("group", value)
+    if not isinstance(group, dict):
+        return set()
+    participants = group.get("participants", group.get("members", []))
+    if not isinstance(participants, list):
+        return set()
+    return {
+        item["id"] for item in participants
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and ID_RE.fullmatch(item["id"])
+    }
 
 
 def parse_amount(value):
@@ -173,6 +181,8 @@ def parse_amount(value):
 
 
 def parse_expense(body):
+    if not isinstance(body, dict):
+        raise ValueError("Expense must be an object")
     required = ("groupId", "title", "amount", "expenseDate", "paidBy", "paidFor", "category", "splitMode")
     missing = [key for key in required if key not in body]
     if missing:
@@ -195,10 +205,10 @@ def parse_expense(body):
         raise ValueError("Invalid expenseDate")
     try:
         parsed_date = datetime.fromisoformat(date_value.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed_date.tzinfo is not None:
+            parsed_date = parsed_date.astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError, OverflowError):
         raise ValueError("expenseDate must be a valid ISO date") from None
-    if parsed_date.tzinfo is not None:
-        parsed_date = parsed_date.astimezone(timezone.utc).replace(tzinfo=None)
     # Reject obviously unreasonable dates.
     if parsed_date.year < 2000 or parsed_date.year > datetime.now(timezone.utc).year + 2:
         raise ValueError("expenseDate is outside the accepted range")
@@ -230,7 +240,16 @@ def parse_expense(body):
             raise ValueError("Invalid shares value") from None
         if not shares.is_finite() or shares <= 0 or shares > MAX_SHARES:
             raise ValueError("Shares must be positive and within the configured limit")
-        normalized.append({"participant": participant, "shares": str(shares.normalize())})
+        # Spliit stores BY_AMOUNT as cents and other shares scaled by 100.
+        precision = Decimal("1") if split_mode == "BY_AMOUNT" else Decimal("0.01")
+        if shares != shares.quantize(precision):
+            raise ValueError("Shares must be whole cents for BY_AMOUNT or have at most two decimal places")
+        normalized.append({"participant": participant, "shares": str(shares)})
+    total_shares = sum(Decimal(item["shares"]) for item in normalized)
+    if split_mode == "BY_AMOUNT" and total_shares != amount_cents:
+        raise ValueError("BY_AMOUNT shares must sum to the expense amount in cents")
+    if split_mode == "BY_PERCENTAGE" and total_shares != 100:
+        raise ValueError("BY_PERCENTAGE shares must sum to 100")
     notes = body.get("notes", "")
     if not isinstance(notes, str) or len(notes) > 2000 or any(ord(c) < 32 and c not in "\n\r\t" for c in notes):
         raise ValueError("Notes must be text up to 2000 characters")
@@ -240,14 +259,23 @@ def parse_expense(body):
 
 
 def rate_limited(ip):
-    now = time.monotonic()
     with _rate_lock:
-        q = _requests[ip]
-        while q and now - q[0] > RATE_WINDOW:
+        now = time.monotonic()
+        # Keep clients ordered by their last accepted request so inactive IPs
+        # can be discarded without scanning every active client's history.
+        cutoff = now - RATE_WINDOW
+        while _requests:
+            oldest = next(iter(_requests.values()))
+            if oldest[-1] > cutoff:
+                break
+            _requests.popitem(last=False)
+        q = _requests.setdefault(ip, deque())
+        while q and q[0] <= cutoff:
             q.popleft()
         if len(q) >= RATE_LIMIT:
             return True
         q.append(now)
+        _requests.move_to_end(ip)
         return False
 
 
@@ -261,6 +289,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "SpliitBridge"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        self.request.settimeout(REQUEST_TIMEOUT)
+        super().setup()
 
     def log_message(self, fmt, *args):
         LOG.info("client=%s request", self.client_address[0])
@@ -286,7 +318,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def route_path(self):
         # Do not percent-decode route paths: IDs are restricted to safe characters.
-        path = urlsplit(self.path).path
+        path = self.path.split("?", 1)[0]
         if path == "/bridge":
             return "/"
         if path.startswith("/bridge/"):
@@ -299,6 +331,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         x_key = self.headers.get("X-API-Key", "")
         auth = self.headers.get("Authorization", "")
         bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not x_key.isascii() or not bearer.isascii():
+            return False
         # Reject conflicting credential sources instead of silently choosing one.
         if x_key and bearer and not hmac.compare_digest(x_key, bearer):
             return False
@@ -348,10 +382,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get_content_type()
         if content_type != "application/json":
             return self.send_json(415, {"error": "application_json_required"})
+        if self.headers.get("Transfer-Encoding") is not None:
+            return self.send_json(400, {"error": "transfer_encoding_not_supported"})
+        length_headers = self.headers.get_all("Content-Length", [])
+        if len(length_headers) > 1:
+            return self.send_json(400, {"error": "ambiguous_content_length"})
         length_header = self.headers.get("Content-Length")
         if length_header is None or not length_header.isascii() or not length_header.isdigit():
             return self.send_json(411, {"error": "content_length_required"})
-        length = int(length_header)
+        # Bound the digit count before int(): Python rejects extremely long
+        # integers, and clients must still get a controlled HTTP response.
+        digits = length_header.lstrip("0") or "0"
+        if len(digits) > len(str(MAX_BODY)):
+            return self.send_json(413, {"error": "request_too_large"})
+        length = int(digits)
         if length <= 0:
             return self.send_json(400, {"error": "empty_body"})
         if length > MAX_BODY:
@@ -368,7 +412,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             )
             if not isinstance(body, dict):
                 return self.send_json(400, {"error": "json_object_required"})
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        except TimeoutError:
+            return self.send_json(408, {"error": "request_timeout"})
+        except (ValueError, RecursionError):
             return self.send_json(400, {"error": "invalid_json"})
         try:
             expense = parse_expense(body)
@@ -382,7 +428,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if any(item["participant"] not in participant_ids for item in expense["paidFor"]):
                 return self.send_json(400, {"error": "invalid_paidFor_participant"})
             preview = {"groupId": expense["groupId"], "title": expense["title"],
-                       "amount": expense["amountCents"], "expenseDate": expense["expenseDate"].isoformat(),
+                       "amount": expense["amountCents"], "expenseDate": expense["expenseDate"].isoformat() + "Z",
                        "paidBy": expense["paidBy"], "paidFor": expense["paidFor"],
                        "category": expense["category"], "splitMode": expense["splitMode"]}
             if path == "/api/expenses/preview":
@@ -392,7 +438,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if not ALLOW_CREATE:
                 return self.send_json(403, {"error": "creation_disabled"})
             expense_form = {"title": expense["title"], "amount": expense["amountCents"],
-                            "expenseDate": expense["expenseDate"].isoformat(),
+                            "expenseDate": expense["expenseDate"].isoformat() + "Z",
                             "category": expense["category"], "paidBy": expense["paidBy"],
                             "paidFor": expense["paidFor"], "splitMode": expense["splitMode"],
                             "saveDefaultSplittingOptions": False, "isReimbursement": False,
@@ -418,15 +464,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global CONFIG
-    if len(API_KEY) < 32:
-        raise SystemExit("API_KEY must be at least 32 characters; use a random secret")
-    parsed = urlsplit(SPLIIT_BASE_URL)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
-        raise SystemExit("SPLIIT_BASE_URL must be a valid http(s) URL without embedded credentials")
+    if len(API_KEY) < 32 or not API_KEY.isascii():
+        raise SystemExit("API_KEY must be at least 32 ASCII characters; use a random secret")
+    try:
+        parsed = urlsplit(SPLIIT_BASE_URL)
+        valid_url = (parsed.scheme in {"http", "https"} and parsed.hostname
+                     and not parsed.username and not parsed.password
+                     and not parsed.query and not parsed.fragment
+                     and (parsed.port is None or 1 <= parsed.port <= 65535)
+                     and not any(c.isspace() or ord(c) < 32 for c in SPLIIT_BASE_URL))
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise SystemExit("SPLIIT_BASE_URL must be a valid http(s) URL without credentials, query or fragment")
     if not 1 <= PORT <= 65535:
         raise SystemExit("PORT is invalid")
-    CONFIG = load_config()
+    if RATE_LIMIT <= 0:
+        raise SystemExit("RATE_LIMIT_PER_MINUTE must be positive")
+    load_config()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     server = BridgeHTTPServer((HOST, PORT), BridgeHandler)

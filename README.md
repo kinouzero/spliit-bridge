@@ -138,9 +138,9 @@ Returns the groups allowed by `config.json`.
 
 ### Get group details
 
-- `GET /api/groups/{group_id}`
+- `GET /api/groups/{group_id}/details`
 
-Retrieves details for a configured group.
+Retrieves details for a configured group. The group and its participants are returned under `data.group`.
 
 ### List categories
 
@@ -172,6 +172,46 @@ docker compose up -d
 
 Only enable creation once you have tested the preview endpoint and verified the payloads.
 
+### Expense payload and validation
+
+Both expense endpoints accept the same JSON object:
+
+```json
+{
+  "groupId": "YOUR_GROUP_ID",
+  "title": "Lunch",
+  "amount": "12.50",
+  "expenseDate": "2026-10-07T12:00:00Z",
+  "paidBy": "PARTICIPANT_1",
+  "paidFor": [
+    {"participant": "PARTICIPANT_1", "shares": 1},
+    {"participant": "PARTICIPANT_2", "shares": 1}
+  ],
+  "category": 1,
+  "splitMode": "EVENLY",
+  "notes": "Optional notes"
+}
+```
+
+- `amount` is in euros, strictly positive, at most 100000, with at most two decimal places. Comma decimals are accepted. The upstream payload and preview use integer cents.
+- `expenseDate` accepts an ISO date or datetime, from year 2000 through the current year plus two. Offsets are converted to UTC; dates without a timezone are interpreted as UTC. The preview and upstream request use an explicit `Z` suffix.
+- `title` must contain 2–200 characters after trimming; control characters are rejected. Optional `notes` allow 2000 characters, including newlines and tabs.
+- `paidBy` and all `paidFor` participants must belong to the configured group. `paidFor` accepts 1–100 distinct participants. Shares default to 1 and must be positive and at most 1000000.
+- `category` must be an integer from 0 to 10000.
+
+| `splitMode` | Meaning of `paidFor[].shares` |
+|---|---|
+| `EVENLY` | Equal split; use the default share of 1 |
+| `BY_SHARES` | Relative weights, with at most two decimal places |
+| `BY_PERCENTAGE` | Percentages with at most two decimal places, totaling exactly 100 |
+| `BY_AMOUNT` | Integer cents totaling exactly the expense amount in cents; for €12.50, use e.g. 625 + 625 |
+
+The bridge checks split totals and precision before previewing or creating an expense. Participant extraction follows the explicit list in [Spliit's group details response](https://github.com/spliit-app/spliit/blob/main/src/trpc/routers/groups/getDetails.procedure.ts); share units follow its [expense schema](https://github.com/spliit-app/spliit/blob/main/src/lib/schemas.ts). Direct group objects with `participants` or `members` are also accepted for compatibility.
+
+Requests require `Content-Type: application/json` and a single valid `Content-Length`, with a maximum body size of 16 KiB. Transfer encoding is unsupported. Socket inactivity is limited to 10 seconds; a timeout while reading the body returns HTTP 408. Invalid expenses return 400, invalid credentials 401, excessive request rates 429, and configuration/upstream failures 502.
+
+`config.json` must contain a `groups` array; an empty array allows no groups. Changes are reloaded on each request. Invalid or unreadable configuration fails closed.
+
 ## Security notes
 
 - Use a strong, unique API key of at least 32 characters.
@@ -189,7 +229,26 @@ Only enable creation once you have tested the preview endpoint and verified the 
 | `PORT` | `8787` | HTTP port |
 | `CONFIG_PATH` | `/app/config.json` | Path to the JSON group configuration |
 | `SPLIIT_BASE_URL` | `http://spliit:3000` | Base URL of the Spliit service, reachable from the bridge container |
-| `API_KEY` | Required | Shared API key; must be at least 32 characters |
+| `API_KEY` | Required | Shared API key; must be at least 32 ASCII characters |
 | `ALLOW_CREATE` | `false` | Enables `POST /api/expenses` only when set to `true` |
-| `RATE_LIMIT_PER_MINUTE` | `120` | Per-process request limit per minute |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Positive per-process, per-client-IP request limit per minute |
 | `LOG_LEVEL` | `INFO` | Logging level |
+
+## Development and tests
+
+Python 3.12 or newer is required for development. Runtime dependencies remain limited to the standard library.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m compileall -q app tests
+flake8 app tests
+pytest -q
+```
+
+`pytest.ini` measures all of `app`, including branches, and requires **100% coverage**. Every run generates `htmlcov/index.html` and `coverage.xml`; these generated files are ignored by Git. To run a focused test without the full-suite coverage gate, use e.g. `pytest --no-cov tests/test_auth.py`.
+
+Tests use local HTTP servers and controlled network failures; they need no running Spliit instance, Docker daemon, or external network. See [TEST_PLAN.md](TEST_PLAN.md) for the audit findings, test scope, and verification limits.
+
+CI runs compilation, lint, and tests on Python 3.12 and 3.13, uploads coverage reports for each version, then builds the Docker image. Release publishing remains restricted to version tags.
